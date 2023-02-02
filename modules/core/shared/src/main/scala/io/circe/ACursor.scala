@@ -304,6 +304,13 @@ abstract class ACursor(private val lastCursor: HCursor, private val lastOp: Curs
   final def as[A](implicit d: Decoder[A]): Decoder.Result[A] = d.tryDecode(this)
 
   /**
+   * Attempt to decode the focus as an `A`, accumulating errors.
+   *
+   * @group Decoding
+   */
+  final def asAccumulating[A](implicit d: Decoder[A]): Decoder.AccumulatingResult[A] = d.tryDecodeAccumulating(this)
+
+  /**
    * Attempt to decode the value at the given key in a JSON object as an `A`.
    *
    * @group Decoding

@@ -13,11 +13,17 @@ import cats.data.{
   Validated,
   ValidatedNel
 }
+import cats.syntax.eq._
 import cats.syntax.either._
+import cats.syntax.functor._
+import cats.syntax.validated._
+import cats.syntax.applicativeError._
 import cats.data.Validated.{ Invalid, Valid }
 import cats.instances.either.{ catsStdInstancesForEither, catsStdSemigroupKForEither }
 import cats.kernel.Order
+import io.circe.DecodingFailure.Reason
 import io.circe.`export`.Exported
+
 import java.io.Serializable
 import java.net.{ URI, URISyntaxException }
 import java.time.{
@@ -40,8 +46,7 @@ import java.time.{
 import java.time.format.DateTimeFormatter
 import java.util.Currency
 import java.util.UUID
-
-import io.circe.DecodingFailure.Reason.{ MissingField, WrongTypeExpectation }
+import io.circe.DecodingFailure.Reason.{ AggregateDecodeFailure, MissingField, WrongTypeExpectation }
 
 import scala.annotation.tailrec
 import scala.collection.immutable.{ Map => ImmutableMap, Set, SortedMap, SortedSet }
@@ -271,17 +276,48 @@ trait Decoder[A] extends Serializable { self =>
    */
   final def or[AA >: A](d: => Decoder[AA]): Decoder[AA] = new Decoder[AA] {
     final def apply(c: HCursor): Decoder.Result[AA] = tryDecode(c)
-    override def tryDecode(c: ACursor): Decoder.Result[AA] = self.tryDecode(c) match {
-      case r @ Right(_) => r
-      case Left(_)      => d.tryDecode(c)
-    }
+    override def tryDecode(c: ACursor): Decoder.Result[AA] =
+      self.tryDecode(c).widen[AA].handleErrorWith { lhsFailure =>
+        d.tryDecode(c).leftMap { rhsFailure =>
+          val referenceHistory = c.history
+          DecodingFailure(
+            AggregateDecodeFailure(
+              unwrapFailures(referenceHistory, lhsFailure).concatNel(unwrapFailures(referenceHistory, rhsFailure))
+            ),
+            c
+          )
+        }
+      }
     override def decodeAccumulating(c: HCursor): Decoder.AccumulatingResult[AA] =
       tryDecodeAccumulating(c)
     override def tryDecodeAccumulating(c: ACursor): Decoder.AccumulatingResult[AA] =
-      self.tryDecodeAccumulating(c) match {
-        case r @ Valid(_) => r
-        case Invalid(i)   => d.tryDecodeAccumulating(c).leftMap(_.concatNel(i))
+      self.tryDecodeAccumulating(c).widen[AA].handleErrorWith { lhsFailures =>
+        d.tryDecodeAccumulating(c).leftMap { rhsFailures =>
+          val referenceHistory = c.history
+          NonEmptyList.one(
+            DecodingFailure(
+              AggregateDecodeFailure(
+                lhsFailures
+                  .flatMap(unwrapFailures(referenceHistory, _))
+                  .concatNel(rhsFailures.flatMap(unwrapFailures(referenceHistory, _)))
+              ),
+              c
+            )
+          )
+        }
       }
+
+    // Flatten the results from a decoder made from a chain of Decoder#or calls
+    private def unwrapFailures(
+      referenceHistory: List[CursorOp],
+      failure: DecodingFailure
+    ): NonEmptyList[DecodingFailure] =
+      if (failure.history === referenceHistory)
+        failure.reason match {
+          case Reason.AggregateDecodeFailure(failures) => failures
+          case _                                       => NonEmptyList.one(failure)
+        }
+      else NonEmptyList.one(failure)
   }
 
   /**
@@ -291,20 +327,22 @@ trait Decoder[A] extends Serializable { self =>
     final def apply(c: HCursor): Decoder.Result[Either[A, B]] = tryDecode(c)
     override def tryDecode(c: ACursor): Decoder.Result[Either[A, B]] = self.tryDecode(c) match {
       case Right(v) => Right(Left(v))
-      case Left(_) =>
+      case Left(aFailure) =>
         decodeB.tryDecode(c) match {
-          case Right(v)    => Right(Right(v))
-          case l @ Left(_) => l.asInstanceOf[Decoder.Result[Either[A, B]]]
+          case Right(v) => Right(Right(v))
+          case Left(bFailure) =>
+            DecodingFailure(AggregateDecodeFailure(NonEmptyList.of(aFailure, bFailure)), c).asLeft[Either[A, B]]
         }
     }
     override def decodeAccumulating(c: HCursor): Decoder.AccumulatingResult[Either[A, B]] = tryDecodeAccumulating(c)
     override def tryDecodeAccumulating(c: ACursor): Decoder.AccumulatingResult[Either[A, B]] =
       self.tryDecodeAccumulating(c) match {
         case Valid(v) => Valid(Left(v))
-        case Invalid(ia) =>
+        case Invalid(aFailuresNel) =>
           decodeB.tryDecodeAccumulating(c) match {
-            case Valid(v)    => Valid(Right(v))
-            case Invalid(ib) => Invalid(ib.concatNel(ia))
+            case Valid(v) => Valid(Right(v))
+            case Invalid(bFailuresNel) =>
+              DecodingFailure(AggregateDecodeFailure(aFailuresNel.concatNel(bFailuresNel)), c).invalidNel[Either[A, B]]
           }
       }
   }
@@ -509,6 +547,18 @@ object Decoder
   final def instance[A](f: HCursor => Result[A]): Decoder[A] = new Decoder[A] {
     final def apply(c: HCursor): Result[A] = f(c)
   }
+
+  /**
+   * Construct an instance from a function that supports accumulating errors
+   *
+   * @group Utilities
+   */
+  final def instanceAccumulating[A](f: HCursor => AccumulatingResult[A]): Decoder[A] =
+    new Decoder[A] {
+      override def apply(c: HCursor): Result[A] = f(c).leftMap(_.head).toEither
+
+      override def decodeAccumulating(c: HCursor): AccumulatingResult[A] = f(c)
+    }
 
   /**
    * Construct an instance from a [[cats.data.StateT]] value.
