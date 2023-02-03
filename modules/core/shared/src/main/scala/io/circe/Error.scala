@@ -2,8 +2,9 @@ package io.circe
 
 import cats.data.NonEmptyList
 import cats._
+import cats.syntax.foldable._
 import io.circe.DecodingFailure.Reason
-import io.circe.DecodingFailure.Reason.{ CustomReason, MissingField, WrongTypeExpectation }
+import io.circe.DecodingFailure.Reason.{ AggregateDecodeFailure, CustomReason, MissingField, WrongTypeExpectation }
 
 /**
  * The base exception type for both decoding and parsing errors.
@@ -67,6 +68,7 @@ sealed abstract class DecodingFailure(private val lazyReason: Eval[Reason]) exte
       case WrongTypeExpectation(expJsType, v) => s"Got value '${v.noSpaces}' with wrong type, expecting $expJsType"
       case MissingField                       => "Missing required field"
       case CustomReason(message)              => message
+      case AggregateDecodeFailure(decodingFailures) => decodingFailures.head.message
     }
 
   final override def getMessage: String = DecodingFailure.showDecodingFailure.show(this)
@@ -169,14 +171,32 @@ object DecodingFailure {
    * Creates compact, human readable string representations for DecodingFailure
    * Cursor history is represented as JS style selections, i.e. ".foo.bar[3]"
    */
-  implicit final val showDecodingFailure: Show[DecodingFailure] =
-    Show.fromToString
+  implicit final val showDecodingFailure: Show[DecodingFailure] = Show.fromToString
+
+  /**
+   * Creates a compact, human readable string representation for DecodingFailure
+   * The primary differences between this and `showDecodingFailure` are:
+   * - Always displays path to root
+   * - Shows nested failures
+   */
+  final val showExpandedDecodingFailure: Show[DecodingFailure] =
+    Show.show { value =>
+      val pathToRoot = value.pathToRootString.getOrElse(PathToRoot.fromHistory(value.history).map(_.asPathString).merge)
+      val displayPath = if (pathToRoot.isBlank) "." else pathToRoot
+      value.reason match {
+        case AggregateDecodeFailure(failures) =>
+          val nestedFailures = failures.mkString_(" or ")(showExpandedDecodingFailure, implicitly)
+          s"DecodingFailure at $displayPath ($nestedFailures)"
+        case _ => s"DecodingFailure at $displayPath (${value.message})"
+      }
+    }
 
   sealed abstract class Reason
   object Reason {
     case object MissingField extends Reason
     case class WrongTypeExpectation(expectedJsonFieldType: String, jsonValue: Json) extends Reason
     case class CustomReason(message: String) extends Reason
+    case class AggregateDecodeFailure(failures: NonEmptyList[DecodingFailure]) extends Reason
   }
 }
 
